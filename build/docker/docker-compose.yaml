@@ -1,160 +1,72 @@
-# This Docker Compose file is meant to be used on a development environment for testing.
-# This environment includes a fake local network, a local database and
-# a volume mounted with the code to see changes on the go.
+FROM node:19.4.0-alpine as ui
 
-# Base configuration for any protocol container
-# Use this on each protocol so share a similar configuration to riotpot
-x-protocol:
-  &protocol
-  profiles:
-    - protocol
-  depends_on:
-    - riotpot
-  networks:
-    honeypot:
+# set working directory
+WORKDIR /app
 
-services:
+# add `/app/node_modules/.bin` to $PATH
+ENV PATH /app/node_modules/.bin:$PATH
 
-  ##########################################
-  # REQUIRED
-  ##########################################
+# install app dependencies
+# add app
+COPY ui/ .
+RUN npm install --silent
 
-  # Tcpdump host that stores all the stuff that happens
-  # in the network
-  tcpdump:
-    image: kaazing/tcpdump
-    container_name: tcpdump
-    network_mode: "host"
-    volumes:
-      - ${PWD:-../..}/tcpdump:/tcpdump
-    # Run tcdump in autorotating mode, with gzip compression
-    # The files will be rotated every 24h or 500MB and named
-    # after the timestamp when the file is created.
-    command: [
-      "-z", "gzip", # compress to gzip
-      "-G", "86400", # 24h in seconds
-      "-C", "500", # maximum file size
-      "-W", "10", # ignored, only affects the name
-      "-v", # verbose
-      "-i", "any", # any interface
-      "-w", "tcpdump/trace_%Y_%m_%d_%H_%M_%S.pcap" # trace_<timestamp>.pcap
-    ]
+# Creates the build
+RUN npm run build --omit=dev
 
+FROM golang:1.18 as builder
 
-  # RIoTPot application
-  riotpot:
-    container_name: riotpot
-    build:
-      context: ${PWD:-../..}/
-    restart: always # restart riotpot when it crashes
-    ports:
-      # Ports under 60 might see errors when unquoted
-      # https://stackoverflow.com/questions/58810789/quotes-on-docker-compose-yml-ports-make-any-difference
-      - "7:7"       # Echo
-      - "21:21"     # FTP
-      - "22:22"     # SSH
-      - "23:23"     # Telnet
-      - "80:80"     # HTTP
-      - "443:443"   # HTTPS
-      - "502:502"   # Modbus
-      - "1900:1900" # UPnP
-      - "1883:1883" # MQTT
-      - "5683:5683" # CoAP
+# Set the working directory to golang working space
+WORKDIR /riotpot
 
-      # Required for the REST API
-      # Note: only available to localhost
-      - "0.0.0.0:3000:3000"
-    environment:
-      - API_HOST=0.0.0.0
-    networks:
-      honeypot:
-      default:
+# Copy the build and `embed.go` files from the ui folder
+COPY --from=ui app/build/ ui/build/
+COPY --from=ui app/embed.go ui/
 
-  ##########################################
-  # PROTOCOLS
-  ##########################################
-  # Use the profile `protocol` to mount the image but do not start it
-  # riotpot will deetermine which containers to start at a later time
+# Copy the dependencies into the image
+COPY go.mod ./
+COPY go.sum ./
 
-  mqtt:
-    image: eclipse-mosquitto
-    container_name: mqtt
-    expose:
-      - "1883"
-    <<: *protocol
+# download all the dependencies
+RUN go mod download
 
-  http:
-    build:
-      context: ./service/custom_httpd
-    container_name: http
-    ports:
-      - "80:80"
-      - "443:443"
-    networks:
-      honeypot:
+# Copy everything into the image
+# Copy only the app files in the image
+COPY api api/
+COPY cmd cmd/
+COPY internal internal/
+COPY pkg pkg/
+COPY tools tools/
 
+# Copy static files
+COPY statik/ statik/
 
-  ftp:
-    build:
-      context: ./service/custom_ftpd
-      dockerfile: Dockerfile
-    container_name: ftp
-    restart: always
-    ports:
-      - "21:21"
-      - "21000-21010:21000-21010"
-    environment:
-      # Passive mode ports range
-      - MIN_PORT=21000
-      - MAX_PORT=21010
-      - USERS=${USERS}
-    volumes:
-      - ./ftp_data:/ftp/ftpuser:Z
-    networks:
-      honeypot:
+ADD Makefile .
 
-  ssh:
-    build:
-      context: ./service/custom_sshd
-      dockerfile: Dockerfile
-    container_name: ssh
-    restart: always
-    ports:
-      - "22:22"
-    secrets:
-      - ssh_users
-    networks:
-      honeypot:
+RUN make build-all
 
-  telnet:
-    build:
-      context: ./service/custom_telnet
-      dockerfile: Dockerfile
-    container_name: telnet
-    restart: always
-    ports:
-      - "23:23"
-    networks:
-      honeypot:
+# Run the command from the Makefile to build all the plugins
+# and build the project
+# -- Comment this line when on development if you know you have a ready to go version built --
+# Disclaimer: if you comment this line, be 100% sure that the binary can be run on linux
+FROM gcr.io/distroless/base-debian10
 
-  modbus:
-    image: oitc/modbus-server
-    container_name: modbus
-    expose:
-      - "502"
-    <<: *protocol
+# --- Debuggable runtime stage (instead of distroless) ---
+FROM debian:bullseye-slim
 
-  ocpp:
-    image: ldonini/ocpp1.6-central-system # v1.6
-    container_name: ocpp
-    expose:
-      - "443"
-    <<: *protocol
+# install a shell + some basic tools
+RUN apt-get update && apt-get install -y \
+    bash curl net-tools iputils-ping vim \
+    && rm -rf /var/lib/apt/lists/*
 
-secrets:
-  ssh_users:
-    file: ./service/custom_sshd/ssh_users.txt
+ENV GIN_MODE=release
 
-networks:
-  honeypot:
-  ui:
+WORKDIR /riotpot
+
+# Copy the dependencies into the image
+COPY --from=builder /riotpot/bin/ ./
+
+# API, required for the UI.
+EXPOSE 2022
+
+CMD ["./riotpot"]
